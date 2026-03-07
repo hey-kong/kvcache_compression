@@ -3,8 +3,10 @@ from typing import Optional
 import logging
 from dataclasses import dataclass
 
-import int4_ext
-
+try:
+    import int4_ext
+except ImportError:
+    int4_ext = None
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +62,15 @@ class QuantizedCompressor:
 
         return ck, cv, meta
 
+
+
+    def _require_int4_ext(self):
+        if int4_ext is None:
+            raise ImportError(
+                "int4_ext is required for 4-bit compress/decompress. "
+                "Please run `pip install -e .` from repository root with CUDA/PyTorch available."
+            )
+
     def _compress_tensor(self, x: torch.Tensor, orig_dtype: torch.dtype):
         # int8
         if self.bits == 8:
@@ -67,6 +78,7 @@ class QuantizedCompressor:
             return q, QuantMeta(scale=scale, dtype=orig_dtype)
 
         # int4
+        self._require_int4_ext()
         q4, scale = self._quantize_int4(x)
         orig_D = x.shape[-1]
         packed = int4_ext.pack_int4(q4.contiguous())
@@ -105,18 +117,35 @@ class QuantizedCompressor:
         return q, scale.to(torch.float32)
 
     @torch.inference_mode()
-    def decompress(self, kv_cache: torch.Tensor, meta: KVQuantMeta):
+    def decompress(self, kv_cache, meta: KVQuantMeta):
         """
         Decompress a KV cache block and restore layout:
         (2, num_layers, block_size, num_kv_heads, head_size)
+
+        kv_cache can be:
+          - Tensor with shape (2, num_layers, ..., head_size/packed_head_size)
+          - Tuple/List: (keys, values). This form supports mixed shapes in
+            partial modes (e.g. mode="k" or mode="v").
+
+        NOTE:
+          For partial modes, do NOT stack compressed K/V before calling this
+          function because packed and unpacked last dimensions differ.
+          Use: decompress((ck, cv), meta)
         """
-        if kv_cache.dim() < 3 or kv_cache.size(0) != 2:
-            raise ValueError("kv_cache must have shape (2, num_layers, ..., head_size/packed_head_size)")
         if not isinstance(meta, KVQuantMeta):
             raise TypeError("meta must be KVQuantMeta")
 
-        keys = kv_cache[0]
-        values = kv_cache[1]
+        if isinstance(kv_cache, torch.Tensor):
+            if kv_cache.dim() < 3 or kv_cache.size(0) != 2:
+                raise ValueError(
+                    "kv_cache must have shape (2, num_layers, ..., head_size/packed_head_size)"
+                )
+            keys, values = kv_cache[0], kv_cache[1]
+        elif isinstance(kv_cache, (tuple, list)) and len(kv_cache) == 2:
+            keys, values = kv_cache[0], kv_cache[1]
+        else:
+            raise TypeError("kv_cache must be a Tensor(2, ...) or a (keys, values) tuple/list")
+
         dk, dv = keys, values
 
         if meta.k is not None:
@@ -128,22 +157,36 @@ class QuantizedCompressor:
 
 
     @torch.inference_mode()
-    def batch_decompress(self, kv_caches: torch.Tensor, metas):
+    def batch_decompress(self, kv_caches, metas):
         """
         Decompress batched KV cache blocks and restore layout:
         (num_blocks, 2, num_layers, block_size, num_kv_heads, head_size)
 
         Args:
-            kv_caches: Tensor shaped (num_blocks, 2, num_layers, ..., head_size/packed_head_size)
+            kv_caches:
+              - Tensor shaped (num_blocks, 2, num_layers, ..., head_size/packed_head_size)
+              - Tuple/List: (keys_batch, values_batch) where each has shape
+                (num_blocks, num_layers, ..., *) and * can differ between K/V
+                for partial modes.
             metas: sequence of KVQuantMeta with length == num_blocks,
                    or a single KVQuantMeta to be reused for all blocks.
         """
-        if kv_caches.dim() < 4 or kv_caches.size(1) != 2:
-            raise ValueError(
-                "kv_caches must have shape (num_blocks, 2, num_layers, ..., head_size/packed_head_size)"
+        if isinstance(kv_caches, torch.Tensor):
+            if kv_caches.dim() < 4 or kv_caches.size(1) != 2:
+                raise ValueError(
+                    "kv_caches must have shape (num_blocks, 2, num_layers, ..., head_size/packed_head_size)"
+                )
+            keys_batch, values_batch = kv_caches[:, 0], kv_caches[:, 1]
+        elif isinstance(kv_caches, (tuple, list)) and len(kv_caches) == 2:
+            keys_batch, values_batch = kv_caches[0], kv_caches[1]
+            if keys_batch.size(0) != values_batch.size(0):
+                raise ValueError("keys_batch and values_batch must share the same num_blocks")
+        else:
+            raise TypeError(
+                "kv_caches must be Tensor(num_blocks, 2, ...) or a (keys_batch, values_batch) tuple/list"
             )
 
-        num_blocks = kv_caches.size(0)
+        num_blocks = keys_batch.size(0)
 
         if isinstance(metas, KVQuantMeta):
             metas = [metas] * num_blocks
@@ -154,7 +197,8 @@ class QuantizedCompressor:
             raise TypeError("each meta in metas must be KVQuantMeta")
 
         restored_blocks = [
-            self.decompress(kv_caches[i], metas[i]) for i in range(num_blocks)
+            self.decompress((keys_batch[i], values_batch[i]), metas[i])
+            for i in range(num_blocks)
         ]
         return torch.stack(restored_blocks, dim=0)
 
@@ -167,6 +211,7 @@ class QuantizedCompressor:
 
         if meta.last_dim is None:
             raise ValueError("INT4 decompress requires last_dim in meta.")
+        self._require_int4_ext()
         i4 = int4_ext.unpack_int4(x.contiguous(), meta.last_dim).float()
         out = i4 * scale
         return out.to(meta.dtype)
