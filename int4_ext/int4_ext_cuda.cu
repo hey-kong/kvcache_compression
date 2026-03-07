@@ -11,16 +11,6 @@ static inline __device__ int8_t sign_extend_4bit(uint8_t v) {
     return (int8_t)((int8_t)(v << 4) >> 4);
 }
 
-static inline int select_num_threads(int64_t n) {
-    if (n <= 4096) {
-        return 256;
-    }
-    if (n <= (1 << 20)) {
-        return 512;
-    }
-    return 1024;
-}
-
 template <typename scalar_t>
 __global__ void layer_absmax_kernel(
     const scalar_t* __restrict__ x,
@@ -157,9 +147,9 @@ std::vector<at::Tensor> quantize_pack_int4_cuda(at::Tensor x) {
 
     auto stream = c10::cuda::getCurrentCUDAStream(x.device().index());
 
-    int reduce_threads = 256;
+    int threads = 256;
     AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, x.scalar_type(), "layer_absmax_kernel", [&] {
-        layer_absmax_kernel<scalar_t><<<layers, reduce_threads, 0, stream.stream()>>>(
+        layer_absmax_kernel<scalar_t><<<layers, threads, 0, stream.stream()>>>(
             x.data_ptr<scalar_t>(),
             scale_1d.data_ptr<float>(),
             layers,
@@ -168,7 +158,6 @@ std::vector<at::Tensor> quantize_pack_int4_cuda(at::Tensor x) {
     });
 
     int64_t n = rows_total * packed_D;
-    int threads = select_num_threads(n);
     int blocks = static_cast<int>((n + threads - 1) / threads);
 
     AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, x.scalar_type(), "quantize_pack_int4_kernel_3d", [&] {
@@ -215,8 +204,8 @@ at::Tensor dequant_unpack_int4_cuda(at::Tensor packed, at::Tensor scale, int64_t
     auto out_2d = out.view({rows_total, orig_D});
     auto scale_1d = scale.view({layers});
 
+    int threads = 256;
     int64_t n = rows_total * orig_D;
-    int threads = select_num_threads(n);
     int blocks = static_cast<int>((n + threads - 1) / threads);
 
     auto stream = c10::cuda::getCurrentCUDAStream(packed.device().index());

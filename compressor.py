@@ -3,10 +3,7 @@ from typing import Optional
 import logging
 from dataclasses import dataclass
 
-try:
-    import int4_ext
-except ImportError:
-    int4_ext = None
+import int4_ext
 
 logger = logging.getLogger(__name__)
 
@@ -92,17 +89,6 @@ class QuantizedCompressor:
         scale = torch.clamp(scale, min=1e-6)
 
         q = torch.round(t / scale).clamp(-127, 127).to(torch.int8)
-        return q, scale.to(torch.float32)
-
-    def _quantize_int4(self, tensor: torch.Tensor):
-        t = tensor.float()
-
-        # Symmetric per-layer quantization
-        abs_max = self._layerwise_abs_max(t)
-        scale = abs_max / 7.0
-        scale = torch.clamp(scale, min=1e-6)
-
-        q = torch.round(t / scale).clamp(-8, 7).to(torch.int8)
         return q, scale.to(torch.float32)
 
     @torch.inference_mode()
