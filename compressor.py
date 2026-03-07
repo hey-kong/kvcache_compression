@@ -316,6 +316,5 @@ class QuantizedCompressor:
 
         if meta.last_dim is None:
             raise ValueError("INT4 decompress requires last_dim in meta.")
-        i4 = int4_ext.unpack_int4(x.contiguous(), meta.last_dim).float()
-        out = i4 * scale
+        out = int4_ext.dequant_unpack_int4(x.contiguous(), scale.contiguous(), meta.last_dim)
         return out.to(meta.dtype)

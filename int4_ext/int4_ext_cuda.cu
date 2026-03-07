@@ -100,6 +100,33 @@ __global__ void quantize_pack_int4_kernel_3d(
     packed[row * packed_D + p] = static_cast<uint8_t>(low | high);
 }
 
+__global__ void dequant_unpack_int4_kernel_2d(
+    const uint8_t* __restrict__ packed,
+    const float* __restrict__ scale,
+    float* __restrict__ out,
+    int64_t rows_total,
+    int64_t rows_per_layer,
+    int64_t orig_D,
+    int64_t packed_D) {
+
+    int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    int64_t n_elems = rows_total * orig_D;
+    if (idx >= n_elems) return;
+
+    int64_t row = idx / orig_D;
+    int64_t d = idx - row * orig_D;
+
+    int64_t layer = row / rows_per_layer;
+    float s = scale[layer];
+
+    int64_t p = d >> 1;
+    uint8_t byte = packed[row * packed_D + p];
+    uint8_t nibble = (d & 1) ? (byte >> 4) : (byte & 0x0F);
+    int8_t q = sign_extend_4bit(nibble);
+
+    out[row * orig_D + d] = static_cast<float>(q) * s;
+}
+
 std::vector<at::Tensor> quantize_pack_int4_cuda(at::Tensor x) {
     c10::cuda::CUDAGuard device_guard(x.device());
 
@@ -164,60 +191,49 @@ std::vector<at::Tensor> quantize_pack_int4_cuda(at::Tensor x) {
     return {packed, scale};
 }
 
-// --------------- unpack ---------------
-
-__global__ void unpack_int4_kernel_2d(
-    const uint8_t* __restrict__ packed,
-    int8_t* __restrict__ out,
-    int64_t rows,
-    int64_t orig_D,
-    int64_t packed_D) {
-
-    int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
-    int64_t n_elems = rows * orig_D;
-    if (idx >= n_elems) return;
-
-    int64_t row = idx / orig_D;
-    int64_t d = idx - row * orig_D;
-
-    int64_t p = d >> 1;
-    uint8_t byte = packed[row * packed_D + p];
-    uint8_t nibble = (d & 1) ? (byte >> 4) : (byte & 0x0F);
-    out[row * orig_D + d] = sign_extend_4bit(nibble);
-}
-
-at::Tensor unpack_int4_cuda(at::Tensor packed, int64_t orig_D) {
+at::Tensor dequant_unpack_int4_cuda(at::Tensor packed, at::Tensor scale, int64_t orig_D) {
     c10::cuda::CUDAGuard device_guard(packed.device());
 
     auto sizes = packed.sizes();
     int64_t packed_D = sizes.back();
+    int64_t layers = sizes[0];
 
-    int64_t rows = 1;
-    for (int i = 0; i < packed.dim() - 1; ++i) rows *= sizes[i];
+    int64_t rows_total = 1;
+    for (int i = 0; i < packed.dim() - 1; ++i) rows_total *= sizes[i];
+
+    int64_t rows_per_layer = 1;
+    for (int i = 1; i < packed.dim() - 1; ++i) rows_per_layer *= sizes[i];
+
+    TORCH_CHECK(scale.numel() == layers, "scale.numel() must equal number of layers");
 
     std::vector<int64_t> out_sizes(sizes.begin(), sizes.end());
     out_sizes.back() = orig_D;
 
-    auto out = torch::empty(out_sizes, packed.options().dtype(torch::kInt8));
+    auto out = torch::empty(out_sizes, packed.options().dtype(torch::kFloat32));
 
-    auto packed_2d = packed.view({rows, packed_D});
-    auto out_2d = out.view({rows, orig_D});
+    auto packed_2d = packed.view({rows_total, packed_D});
+    auto out_2d = out.view({rows_total, orig_D});
+    auto scale_1d = scale.view({layers});
 
-    int64_t n = rows * orig_D;
+    int64_t n = rows_total * orig_D;
     int threads = select_num_threads(n);
-    int blocks = (int)((n + threads - 1) / threads);
+    int blocks = static_cast<int>((n + threads - 1) / threads);
 
     auto stream = c10::cuda::getCurrentCUDAStream(packed.device().index());
 
-    unpack_int4_kernel_2d<<<blocks, threads, 0, stream.stream()>>>(
+    dequant_unpack_int4_kernel_2d<<<blocks, threads, 0, stream.stream()>>>(
         packed_2d.data_ptr<uint8_t>(),
-        out_2d.data_ptr<int8_t>(),
-        rows, orig_D, packed_D
+        scale_1d.data_ptr<float>(),
+        out_2d.data_ptr<float>(),
+        rows_total,
+        rows_per_layer,
+        orig_D,
+        packed_D
     );
 
     auto err = cudaGetLastError();
     if (err != cudaSuccess) {
-        TORCH_CHECK(false, "unpack_int4_kernel launch failed: ", cudaGetErrorString(err));
+        TORCH_CHECK(false, "dequant_unpack_int4 kernel launch failed: ", cudaGetErrorString(err));
     }
     return out;
 }
