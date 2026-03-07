@@ -69,9 +69,8 @@ class QuantizedCompressor:
             return q, QuantMeta(scale=scale, dtype=orig_dtype)
 
         # int4
-        q4, scale = self._quantize_int4(x)
         orig_D = x.shape[-1]
-        packed = int4_ext.pack_int4(q4.contiguous())
+        packed, scale = int4_ext.quantize_pack_int4(x.contiguous())
         return packed, QuantMeta(scale=scale, last_dim=orig_D, dtype=orig_dtype)
 
     def _layerwise_abs_max(self, tensor: torch.Tensor):
@@ -146,7 +145,7 @@ class QuantizedCompressor:
         return torch.stack([dk, dv], dim=0)
 
     @torch.inference_mode()
-    def batch_decompress(self, kv_caches, metas):
+    def batch_decompress(self, kv_caches, metas, out: Optional[torch.Tensor] = None):
         """
         Decompress batched KV cache blocks and restore layout:
         (num_blocks, 2, num_layers, block_size, num_kv_heads, head_size)
@@ -159,6 +158,11 @@ class QuantizedCompressor:
                 for partial modes.
             metas: sequence of KVQuantMeta with length == num_blocks,
                    or a single KVQuantMeta to be reused for all blocks.
+            out: Optional preallocated output tensor returned by
+                 `allocate_batch_decompress_buffer`. If provided,
+                 batch_decompress only performs decompression and write-back.
+                 If None, keeps original logic by decompressing each block and
+                 stacking the results.
         """
         if isinstance(kv_caches, torch.Tensor):
             if kv_caches.dim() < 4 or kv_caches.size(1) != 2:
@@ -177,6 +181,60 @@ class QuantizedCompressor:
 
         num_blocks = keys_batch.size(0)
 
+        if out is None:
+            if isinstance(metas, KVQuantMeta):
+                metas = [metas] * num_blocks
+
+            if len(metas) != num_blocks:
+                raise ValueError(f"len(metas)={len(metas)} must equal num_blocks={num_blocks}")
+            if any(not isinstance(m, KVQuantMeta) for m in metas):
+                raise TypeError("each meta in metas must be KVQuantMeta")
+
+            return torch.stack([
+                self.decompress((keys_batch[i], values_batch[i]), metas[i])
+                for i in range(num_blocks)
+            ], dim=0)
+
+        for i in range(num_blocks):
+            meta_k = metas[i].k
+            meta_v = metas[i].v
+
+            if meta_k is None:
+                out[i, 0].copy_(keys_batch[i])
+            else:
+                out[i, 0].copy_(self._decompress_tensor(keys_batch[i], meta_k))
+
+            if meta_v is None:
+                out[i, 1].copy_(values_batch[i])
+            else:
+                out[i, 1].copy_(self._decompress_tensor(values_batch[i], meta_v))
+
+        return out
+
+    @torch.inference_mode()
+    def allocate_batch_decompress_buffer(self, kv_caches, metas):
+        """
+        Allocate and validate output buffer for `batch_decompress`.
+
+        Returns a tensor shaped:
+        (num_blocks, 2, num_layers, block_size, num_kv_heads, head_size)
+        """
+        if isinstance(kv_caches, torch.Tensor):
+            if kv_caches.dim() < 4 or kv_caches.size(1) != 2:
+                raise ValueError(
+                    "kv_caches must have shape (num_blocks, 2, num_layers, ..., head_size/packed_head_size)"
+                )
+            keys_batch, values_batch = kv_caches[:, 0], kv_caches[:, 1]
+        elif isinstance(kv_caches, (tuple, list)) and len(kv_caches) == 2:
+            keys_batch, values_batch = kv_caches[0], kv_caches[1]
+            if keys_batch.size(0) != values_batch.size(0):
+                raise ValueError("keys_batch and values_batch must share the same num_blocks")
+        else:
+            raise TypeError(
+                "kv_caches must be Tensor(num_blocks, 2, ...) or a (keys_batch, values_batch) tuple/list"
+            )
+
+        num_blocks = keys_batch.size(0)
         if isinstance(metas, KVQuantMeta):
             metas = [metas] * num_blocks
 
@@ -185,11 +243,69 @@ class QuantizedCompressor:
         if any(not isinstance(m, KVQuantMeta) for m in metas):
             raise TypeError("each meta in metas must be KVQuantMeta")
 
-        restored_blocks = [
-            self.decompress((keys_batch[i], values_batch[i]), metas[i])
-            for i in range(num_blocks)
-        ]
-        return torch.stack(restored_blocks, dim=0)
+        meta_k = [m.k for m in metas]
+        meta_v = [m.v for m in metas]
+
+        out_k_shape = self._infer_batch_output_shape(keys_batch, meta_k)
+        out_v_shape = self._infer_batch_output_shape(values_batch, meta_v)
+        if out_k_shape != out_v_shape:
+            raise ValueError(
+                "decompressed K/V output shapes must match; got "
+                f"K={out_k_shape}, V={out_v_shape}"
+            )
+
+        out_dtype = self._select_batch_output_dtype(keys_batch, values_batch, meta_k, meta_v)
+        expected_shape = (num_blocks, 2, *out_k_shape[1:])
+        return torch.empty(expected_shape, device=keys_batch.device, dtype=out_dtype)
+
+    def _infer_batch_output_shape(self, x_batch: torch.Tensor, side_metas):
+        if not side_metas:
+            raise ValueError("side_metas must be non-empty")
+
+        out_shape = None
+        for meta in side_metas:
+            if meta is None:
+                candidate = tuple(x_batch.shape)
+            elif self.bits == 4:
+                if meta.last_dim is None:
+                    raise ValueError("INT4 decompress requires last_dim in meta.")
+                candidate = (*x_batch.shape[:-1], meta.last_dim)
+            else:
+                candidate = tuple(x_batch.shape)
+
+            if out_shape is None:
+                out_shape = candidate
+            elif out_shape != candidate:
+                raise ValueError(
+                    "inconsistent output shapes in batch_decompress: "
+                    f"{out_shape} vs {candidate}"
+                )
+
+        return out_shape
+
+    def _select_batch_output_dtype(self, keys_batch, values_batch, meta_k, meta_v):
+        key_dtype = meta_k[0].dtype if meta_k and meta_k[0] is not None else keys_batch.dtype
+        val_dtype = meta_v[0].dtype if meta_v and meta_v[0] is not None else values_batch.dtype
+
+        for m in meta_k:
+            if (m is not None) and (m.dtype != key_dtype):
+                raise ValueError(
+                    "inconsistent K output dtype in batch_decompress: "
+                    f"{key_dtype} vs {m.dtype}"
+                )
+        for m in meta_v:
+            if (m is not None) and (m.dtype != val_dtype):
+                raise ValueError(
+                    "inconsistent V output dtype in batch_decompress: "
+                    f"{val_dtype} vs {m.dtype}"
+                )
+
+        if key_dtype != val_dtype:
+            raise ValueError(
+                "K/V output dtype mismatch in batch_decompress: "
+                f"{key_dtype} vs {val_dtype}"
+            )
+        return key_dtype
 
     def _decompress_tensor(self, x, meta: QuantMeta):
         scale = meta.scale.to(x.device, torch.float32)
@@ -200,6 +316,5 @@ class QuantizedCompressor:
 
         if meta.last_dim is None:
             raise ValueError("INT4 decompress requires last_dim in meta.")
-        i4 = int4_ext.unpack_int4(x.contiguous(), meta.last_dim).float()
-        out = i4 * scale
+        out = int4_ext.dequant_unpack_int4(x.contiguous(), scale.contiguous(), meta.last_dim)
         return out.to(meta.dtype)
