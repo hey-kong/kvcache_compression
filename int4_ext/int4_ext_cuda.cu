@@ -10,6 +10,17 @@ static inline __device__ int8_t sign_extend_4bit(uint8_t v) {
     return (int8_t)((int8_t)(v << 4) >> 4);
 }
 
+static inline int select_num_threads(int64_t n) {
+    // Prefer fewer threads for small workloads to reduce instantaneous SM resource usage.
+    if (n <= 4096) {
+        return 64;
+    }
+    if (n <= 1 << 20) {
+        return 128;
+    }
+    return 256;
+}
+
 __global__ void unpack_int4_kernel_2d(
     const uint8_t* __restrict__ packed,
     int8_t* __restrict__ out,
@@ -47,8 +58,8 @@ at::Tensor unpack_int4_cuda(at::Tensor packed, int64_t orig_D) {
     auto packed_2d = packed.view({rows, packed_D});
     auto out_2d    = out.view({rows, orig_D});
 
-    int threads = 256;
     int64_t n = rows * orig_D;
+    int threads = select_num_threads(n);
     int blocks = (int)((n + threads - 1) / threads);
 
     auto stream = c10::cuda::getCurrentCUDAStream(packed.device().index());
@@ -99,13 +110,14 @@ __global__ void pack_int4_kernel_2d(
     packed[row * packed_D + p] = (uint8_t)(low | high);
 }
 
-at::Tensor pack_int4_cuda(at::Tensor q, int64_t orig_D) {
+at::Tensor pack_int4_cuda(at::Tensor q) {
     c10::cuda::CUDAGuard device_guard(q.device());
 
     auto sizes = q.sizes();
     int64_t rows = 1;
     for (int i = 0; i < q.dim() - 1; ++i) rows *= sizes[i];
 
+    int64_t orig_D = q.size(-1);
     int64_t packed_D = (orig_D + 1) / 2;
 
     std::vector<int64_t> out_sizes(sizes.begin(), sizes.end());
@@ -116,8 +128,8 @@ at::Tensor pack_int4_cuda(at::Tensor q, int64_t orig_D) {
     auto q_2d = q.view({rows, orig_D});
     auto p_2d = packed.view({rows, packed_D});
 
-    int threads = 256;
     int64_t n = rows * packed_D;
+    int threads = select_num_threads(n);
     int blocks = (int)((n + threads - 1) / threads);
 
     auto stream = c10::cuda::getCurrentCUDAStream(q.device().index());
