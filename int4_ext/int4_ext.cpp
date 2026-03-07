@@ -2,7 +2,7 @@
 #include <vector>
 
 torch::Tensor unpack_int4_cuda(torch::Tensor packed, int64_t orig_D);
-torch::Tensor pack_int4_cuda(torch::Tensor q, int64_t orig_D);
+torch::Tensor pack_int4_cuda(torch::Tensor q);
 
 torch::Tensor unpack_int4(torch::Tensor packed, int64_t orig_D) {
   TORCH_CHECK(packed.is_cuda(), "packed must be a CUDA tensor");
@@ -12,13 +12,12 @@ torch::Tensor unpack_int4(torch::Tensor packed, int64_t orig_D) {
   return unpack_int4_cuda(packed, orig_D);
 }
 
-torch::Tensor pack_int4(torch::Tensor q, int64_t orig_D) {
+torch::Tensor pack_int4(torch::Tensor q) {
   TORCH_CHECK(q.is_cuda(), "q must be a CUDA tensor");
   TORCH_CHECK(q.dtype() == torch::kInt8, "q must be int8");
   TORCH_CHECK(q.is_contiguous(), "q must be contiguous");
-  TORCH_CHECK(orig_D > 0, "orig_D must be > 0");
-  TORCH_CHECK(q.size(-1) == orig_D, "q.size(-1) must equal orig_D");
-  return pack_int4_cuda(q, orig_D);
+  TORCH_CHECK(q.size(-1) > 0, "q.size(-1) must be > 0");
+  return pack_int4_cuda(q);
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
