@@ -13,68 +13,12 @@ static inline __device__ int8_t sign_extend_4bit(uint8_t v) {
 static inline int select_num_threads(int64_t n) {
     // Prefer fewer threads for small workloads to reduce instantaneous SM resource usage.
     if (n <= 4096) {
-        return 64;
+        return 256;
     }
     if (n <= 1 << 20) {
-        return 128;
+        return 512;
     }
-    return 256;
-}
-
-__global__ void unpack_int4_kernel_2d(
-    const uint8_t* __restrict__ packed,
-    int8_t* __restrict__ out,
-    int64_t rows,
-    int64_t orig_D,
-    int64_t packed_D) {
-
-    int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
-    int64_t n_elems = rows * orig_D;
-    if (idx >= n_elems) return;
-
-    int64_t row = idx / orig_D;
-    int64_t d   = idx - row * orig_D;
-
-    int64_t p = d >> 1;
-    uint8_t byte = packed[row * packed_D + p];
-    uint8_t nibble = (d & 1) ? (byte >> 4) : (byte & 0x0F);
-    out[row * orig_D + d] = sign_extend_4bit(nibble);
-}
-
-at::Tensor unpack_int4_cuda(at::Tensor packed, int64_t orig_D) {
-    c10::cuda::CUDAGuard device_guard(packed.device());
-
-    auto sizes = packed.sizes();
-    int64_t packed_D = sizes.back();
-
-    int64_t rows = 1;
-    for (int i = 0; i < packed.dim() - 1; ++i) rows *= sizes[i];
-
-    std::vector<int64_t> out_sizes(sizes.begin(), sizes.end());
-    out_sizes.back() = orig_D;
-
-    auto out = torch::empty(out_sizes, packed.options().dtype(torch::kInt8));
-
-    auto packed_2d = packed.view({rows, packed_D});
-    auto out_2d    = out.view({rows, orig_D});
-
-    int64_t n = rows * orig_D;
-    int threads = select_num_threads(n);
-    int blocks = (int)((n + threads - 1) / threads);
-
-    auto stream = c10::cuda::getCurrentCUDAStream(packed.device().index());
-
-    unpack_int4_kernel_2d<<<blocks, threads, 0, stream.stream()>>>(
-        packed_2d.data_ptr<uint8_t>(),
-        out_2d.data_ptr<int8_t>(),
-        rows, orig_D, packed_D
-    );
-
-    auto err = cudaGetLastError();
-    if (err != cudaSuccess) {
-        TORCH_CHECK(false, "unpack_int4_kernel launch failed: ", cudaGetErrorString(err));
-    }
-    return out;
+    return 1024;
 }
 
 // ---------------- pack ----------------
@@ -145,4 +89,62 @@ at::Tensor pack_int4_cuda(at::Tensor q) {
         TORCH_CHECK(false, "pack_int4_kernel launch failed: ", cudaGetErrorString(err));
     }
     return packed;
+}
+
+// --------------- unpack ---------------
+
+__global__ void unpack_int4_kernel_2d(
+    const uint8_t* __restrict__ packed,
+    int8_t* __restrict__ out,
+    int64_t rows,
+    int64_t orig_D,
+    int64_t packed_D) {
+
+    int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    int64_t n_elems = rows * orig_D;
+    if (idx >= n_elems) return;
+
+    int64_t row = idx / orig_D;
+    int64_t d   = idx - row * orig_D;
+
+    int64_t p = d >> 1;
+    uint8_t byte = packed[row * packed_D + p];
+    uint8_t nibble = (d & 1) ? (byte >> 4) : (byte & 0x0F);
+    out[row * orig_D + d] = sign_extend_4bit(nibble);
+}
+
+at::Tensor unpack_int4_cuda(at::Tensor packed, int64_t orig_D) {
+    c10::cuda::CUDAGuard device_guard(packed.device());
+
+    auto sizes = packed.sizes();
+    int64_t packed_D = sizes.back();
+
+    int64_t rows = 1;
+    for (int i = 0; i < packed.dim() - 1; ++i) rows *= sizes[i];
+
+    std::vector<int64_t> out_sizes(sizes.begin(), sizes.end());
+    out_sizes.back() = orig_D;
+
+    auto out = torch::empty(out_sizes, packed.options().dtype(torch::kInt8));
+
+    auto packed_2d = packed.view({rows, packed_D});
+    auto out_2d    = out.view({rows, orig_D});
+
+    int64_t n = rows * orig_D;
+    int threads = select_num_threads(n);
+    int blocks = (int)((n + threads - 1) / threads);
+
+    auto stream = c10::cuda::getCurrentCUDAStream(packed.device().index());
+
+    unpack_int4_kernel_2d<<<blocks, threads, 0, stream.stream()>>>(
+        packed_2d.data_ptr<uint8_t>(),
+        out_2d.data_ptr<int8_t>(),
+        rows, orig_D, packed_D
+    );
+
+    auto err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        TORCH_CHECK(false, "unpack_int4_kernel launch failed: ", cudaGetErrorString(err));
+    }
+    return out;
 }

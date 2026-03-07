@@ -62,15 +62,6 @@ class QuantizedCompressor:
 
         return ck, cv, meta
 
-
-
-    def _require_int4_ext(self):
-        if int4_ext is None:
-            raise ImportError(
-                "int4_ext is required for 4-bit compress/decompress. "
-                "Please run `pip install -e .` from repository root with CUDA/PyTorch available."
-            )
-
     def _compress_tensor(self, x: torch.Tensor, orig_dtype: torch.dtype):
         # int8
         if self.bits == 8:
@@ -78,7 +69,6 @@ class QuantizedCompressor:
             return q, QuantMeta(scale=scale, dtype=orig_dtype)
 
         # int4
-        self._require_int4_ext()
         q4, scale = self._quantize_int4(x)
         orig_D = x.shape[-1]
         packed = int4_ext.pack_int4(q4.contiguous())
@@ -155,7 +145,6 @@ class QuantizedCompressor:
 
         return torch.stack([dk, dv], dim=0)
 
-
     @torch.inference_mode()
     def batch_decompress(self, kv_caches, metas):
         """
@@ -211,7 +200,6 @@ class QuantizedCompressor:
 
         if meta.last_dim is None:
             raise ValueError("INT4 decompress requires last_dim in meta.")
-        self._require_int4_ext()
         i4 = int4_ext.unpack_int4(x.contiguous(), meta.last_dim).float()
         out = i4 * scale
         return out.to(meta.dtype)
