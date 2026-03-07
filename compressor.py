@@ -69,9 +69,8 @@ class QuantizedCompressor:
             return q, QuantMeta(scale=scale, dtype=orig_dtype)
 
         # int4
-        q4, scale = self._quantize_int4(x)
         orig_D = x.shape[-1]
-        packed = int4_ext.pack_int4(q4.contiguous())
+        packed, scale = int4_ext.quantize_pack_int4(x.contiguous())
         return packed, QuantMeta(scale=scale, last_dim=orig_D, dtype=orig_dtype)
 
     def _layerwise_abs_max(self, tensor: torch.Tensor):
