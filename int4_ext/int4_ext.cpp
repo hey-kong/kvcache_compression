@@ -1,15 +1,18 @@
 #include <torch/extension.h>
 #include <vector>
 
-torch::Tensor pack_int4_cuda(torch::Tensor q);
+std::vector<torch::Tensor> quantize_pack_int4_cuda(torch::Tensor x);
 torch::Tensor unpack_int4_cuda(torch::Tensor packed, int64_t orig_D);
 
-torch::Tensor pack_int4(torch::Tensor q) {
-  TORCH_CHECK(q.is_cuda(), "q must be a CUDA tensor");
-  TORCH_CHECK(q.dtype() == torch::kInt8, "q must be int8");
-  TORCH_CHECK(q.is_contiguous(), "q must be contiguous");
-  TORCH_CHECK(q.size(-1) > 0, "q.size(-1) must be > 0");
-  return pack_int4_cuda(q);
+std::vector<torch::Tensor> quantize_pack_int4(torch::Tensor x) {
+  TORCH_CHECK(x.is_cuda(), "x must be a CUDA tensor");
+  TORCH_CHECK(x.is_floating_point(), "x must be a floating-point tensor");
+  TORCH_CHECK(x.is_contiguous(), "x must be contiguous");
+  TORCH_CHECK(x.dim() >= 2, "x.dim() must be >= 2");
+  TORCH_CHECK(x.size(0) > 0, "x.size(0) must be > 0");
+  TORCH_CHECK(x.size(-1) > 0, "x.size(-1) must be > 0");
+
+  return quantize_pack_int4_cuda(x);
 }
 
 torch::Tensor unpack_int4(torch::Tensor packed, int64_t orig_D) {
@@ -21,6 +24,6 @@ torch::Tensor unpack_int4(torch::Tensor packed, int64_t orig_D) {
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-  m.def("pack_int4", &pack_int4, "Pack int8 [-8,7] -> packed uint8 (CUDA)");
+  m.def("quantize_pack_int4", &quantize_pack_int4, "Quantize to int4 and pack uint8 (CUDA)");
   m.def("unpack_int4", &unpack_int4, "Unpack int4 (packed uint8) -> int8 (CUDA)");
 }
