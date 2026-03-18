@@ -3,7 +3,7 @@ from typing import Optional
 import logging
 from dataclasses import dataclass
 
-import int4_ext
+from . import int4_ext
 
 logger = logging.getLogger(__name__)
 
