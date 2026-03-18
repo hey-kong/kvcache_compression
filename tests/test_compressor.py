@@ -6,7 +6,7 @@ import torch
 from quant.quant_compressor import QuantizedCompressor
 
 
-HAS_INT4_EXT = importlib.util.find_spec("int4_ext._C") is not None
+HAS_INT4_EXT = importlib.util.find_spec("quant.int4_ext._C") is not None
 
 
 def _make_kv_cache(dtype=torch.float16):
