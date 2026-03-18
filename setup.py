@@ -4,8 +4,7 @@ from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 setup(
     name="kvcache_compression",
     version="0.1.0",
-    packages=find_packages(include=["int4_ext", "int4_ext.*"]),
-    py_modules=["compressor"],
+    packages=find_packages(include=["int4_ext", "int4_ext.*", "quant", "quant.*", "huffman", "huffman.*"]),
     ext_modules=[
         CUDAExtension(
             name="int4_ext._C",
