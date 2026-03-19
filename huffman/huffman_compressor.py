@@ -9,6 +9,20 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import torch
 
+try:
+    from ._C import (
+        decompress_layer_parallel_cpp,
+        huffman_decode_symbols_cpp,
+        huffman_encode_symbols_cpp,
+    )
+
+    _HAS_HUFFMAN_EXT = True
+except ImportError:
+    huffman_encode_symbols_cpp = None
+    huffman_decode_symbols_cpp = None
+    decompress_layer_parallel_cpp = None
+    _HAS_HUFFMAN_EXT = False
+
 
 @dataclass
 class HuffmanCodebook:
@@ -156,20 +170,51 @@ class HuffmanCompressor:
 
         workers = num_blocks if num_workers is None else self._resolve_num_workers(num_workers)
 
-        def work_block(block_idx: int) -> Tuple[int, List[List[torch.Tensor]]]:
-            block_out: List[List[torch.Tensor]] = [[], []]
+        if _HAS_HUFFMAN_EXT:
             for layer_idx in range(num_layers):
                 for kv_idx in range(2):
-                    block_out[kv_idx].append(
-                        self._decompress_chunk(chunks_batch[block_idx][kv_idx][layer_idx])
-                    )
-            return block_idx, block_out
+                    layer_chunks = [chunks_batch[block_idx][kv_idx][layer_idx] for block_idx in range(num_blocks)]
 
-        with ThreadPoolExecutor(max_workers=workers) as ex:
-            for block_idx, block_out in ex.map(work_block, range(num_blocks)):
-                for kv_idx in range(2):
-                    for layer_idx in range(num_layers):
-                        out[block_idx, kv_idx, layer_idx] = block_out[kv_idx][layer_idx]
+                    non_exp_bytes_list = [chunk.non_exp_bytes for chunk in layer_chunks]
+                    bitstream_list = [chunk.exp_bitstream for chunk in layer_chunks]
+                    num_valid_bits_list = [int(chunk.exp_num_valid_bits) for chunk in layer_chunks]
+                    expected_num_symbols_list = [int(chunk.exp_num_symbols) for chunk in layer_chunks]
+                    left_nodes_list: List[List[int]] = []
+                    right_nodes_list: List[List[int]] = []
+                    symbol_nodes_list: List[List[int]] = []
+                    for chunk in layer_chunks:
+                        left, right, symbol = self._get_decode_trie(chunk.codebook)
+                        left_nodes_list.append(left)
+                        right_nodes_list.append(right)
+                        symbol_nodes_list.append(symbol)
+
+                    layer_bits_list = decompress_layer_parallel_cpp(
+                        non_exp_bytes_list,
+                        bitstream_list,
+                        num_valid_bits_list,
+                        expected_num_symbols_list,
+                        left_nodes_list,
+                        right_nodes_list,
+                        symbol_nodes_list,
+                        int(workers),
+                    )
+
+                    for block_idx, bits in enumerate(layer_bits_list):
+                        shape = layer_chunks[block_idx].orig_shape
+                        out[block_idx, kv_idx, layer_idx] = torch.from_numpy(bits.copy()).view(torch.bfloat16).reshape(shape)
+        else:
+            def work_block_layer(block_idx: int, layer_idx: int) -> Tuple[int, torch.Tensor, torch.Tensor]:
+                k = self._decompress_chunk(chunks_batch[block_idx][0][layer_idx])
+                v = self._decompress_chunk(chunks_batch[block_idx][1][layer_idx])
+                return block_idx, k, v
+
+            with ThreadPoolExecutor(max_workers=workers) as ex:
+                for layer_idx in range(num_layers):
+                    for block_idx, k, v in ex.map(
+                        lambda b: work_block_layer(b, layer_idx), range(num_blocks)
+                    ):
+                        out[block_idx, 0, layer_idx] = k
+                        out[block_idx, 1, layer_idx] = v
 
         return out
 
@@ -356,6 +401,16 @@ class HuffmanCompressor:
         symbols: np.ndarray,
         codebook: HuffmanCodebook,
     ) -> Tuple[bytes, int]:
+        if _HAS_HUFFMAN_EXT:
+            codes = [""] * 256
+            for sym, bits in codebook.encode_table.items():
+                codes[int(sym)] = bits
+            encoded, num_valid_bits = huffman_encode_symbols_cpp(
+                np.asarray(symbols, dtype=np.uint8),
+                codes,
+            )
+            return encoded, int(num_valid_bits)
+
         encode_compiled = self._get_compiled_encode_table(codebook)
         out = bytearray()
         bit_buffer = 0
@@ -387,6 +442,16 @@ class HuffmanCompressor:
         expected_num_symbols: int,
     ) -> np.ndarray:
         left, right, symbol = self._get_decode_trie(codebook)
+        if _HAS_HUFFMAN_EXT:
+            return huffman_decode_symbols_cpp(
+                bitstream,
+                int(num_valid_bits),
+                left,
+                right,
+                symbol,
+                int(expected_num_symbols),
+            )
+
         node = 0
         out = np.empty(expected_num_symbols, dtype=np.uint8)
         out_idx = 0
