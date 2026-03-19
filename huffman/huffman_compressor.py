@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import heapq
 import os
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
@@ -104,8 +103,64 @@ class HuffmanCompressor:
         self,
         chunks_batch: List[List[List[CompressedChunk]]],
         device: Optional[torch.device | str] = None,
+    ) -> torch.Tensor:
+        """Single-thread decompression."""
+        self._assert_cpu_device(device)
+        self._validate_chunk_batch(chunks_batch)
+
+        num_blocks = len(chunks_batch)
+        num_layers = len(chunks_batch[0][0])
+        block_size, num_kv_heads, head_size = chunks_batch[0][0][0].orig_shape
+
+        out = torch.empty(
+            (num_blocks, 2, num_layers, block_size, num_kv_heads, head_size),
+            dtype=torch.bfloat16,
+            device="cpu",
+        )
+
+        for block_idx in range(num_blocks):
+            for kv_idx in range(2):
+                for layer_idx in range(num_layers):
+                    chunk = chunks_batch[block_idx][kv_idx][layer_idx]
+                    if not _HAS_HUFFMAN_EXT:
+                        raise RuntimeError(
+                            "Single-thread decompress requires Huffman C++ extension "
+                            "(huffman_decode_symbols_cpp)"
+                        )
+                    non_exp = np.frombuffer(chunk.non_exp_bytes, dtype=np.uint8)
+                    left, right, symbol = self._get_decode_trie(chunk.codebook)
+                    exp = np.asarray(
+                        huffman_decode_symbols_cpp(
+                            chunk.exp_bitstream,
+                            int(chunk.exp_num_valid_bits),
+                            left,
+                            right,
+                            symbol,
+                            int(chunk.exp_num_symbols),
+                        ),
+                        dtype=np.uint8,
+                    )
+                    if non_exp.size != exp.size:
+                        raise RuntimeError("Size mismatch during decompression")
+                    bits = (
+                        (non_exp.astype(np.uint16) >> 7) << 15
+                        | (exp.astype(np.uint16) << 7)
+                        | (non_exp.astype(np.uint16) & 0x7F)
+                    ).astype(np.uint16, copy=False)
+                    out[block_idx, kv_idx, layer_idx] = torch.from_numpy(bits.copy()).view(
+                        torch.bfloat16
+                    ).reshape(chunk.orig_shape)
+
+        return out
+
+    @torch.inference_mode()
+    def decompress_parallel(
+        self,
+        chunks_batch: List[List[List[CompressedChunk]]],
+        device: Optional[torch.device | str] = None,
         num_workers: Optional[int] = None,
     ) -> torch.Tensor:
+        """Multi-thread decompression."""
         self._assert_cpu_device(device)
         self._validate_chunk_batch(chunks_batch)
 
