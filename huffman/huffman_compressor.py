@@ -208,8 +208,8 @@ class HuffmanCompressor:
                     shape = layer_chunks[block_idx].orig_shape
                     decompressed_kv_caches[block_idx, kv_idx, layer_idx] = torch.from_numpy(bits.copy()).view(torch.bfloat16).reshape(shape)
 
-                # layer_cpu = decompressed_kv_caches[:, :, layer_idx]
-                # layer_gpu = layer_cpu.to("cuda", non_blocking=True)
+            # layer_cpu = decompressed_kv_caches[:, :, layer_idx]
+            # layer_gpu = layer_cpu.to("cuda", non_blocking=True)
 
         return decompressed_kv_caches
 
@@ -235,8 +235,7 @@ class HuffmanCompressor:
                 payload_size = len(c.non_exp_bytes) + len(c.exp_bitstream)
                 kv_payload_size += payload_size
                 total_size_bytes += payload_size
-                for _, code in c.codebook.encode_table.items():
-                    total_size_bytes += 1 + 2 + (len(code) + 7) // 8
+                total_size_bytes += self._estimate_codebook_size_bytes(c.codebook)
 
             if kv_idx == 0:
                 k_size_bytes = kv_payload_size
@@ -244,6 +243,20 @@ class HuffmanCompressor:
                 v_size_bytes = kv_payload_size
 
         return total_size_bytes, k_size_bytes, v_size_bytes
+
+    def _estimate_codebook_size_bytes(self, codebook: HuffmanCodebook) -> int:
+        """Estimate codebook bytes using an explicit compact serialization layout."""
+        # uint16 entry_count
+        size = 2
+        for _, code in codebook.encode_table.items():
+            code_len = len(code)
+            if code_len > 255:
+                # With <=256 symbols this should not happen, but keep a safe fallback.
+                size += 1 + 2 + (code_len + 7) // 8
+            else:
+                # uint8 symbol + uint8 code_len + packed code bits
+                size += 1 + 1 + (code_len + 7) // 8
+        return size
 
     def original_size_bytes(self, kv_cache: torch.Tensor) -> int:
         return kv_cache.numel() * kv_cache.element_size()
@@ -298,6 +311,8 @@ class HuffmanCompressor:
 
         bits = self._bf16_tensor_to_uint16_numpy(x)
         non_exp, exp = self._split_bf16_bits(bits)
+        # Build one Huffman codebook per compressed chunk (not per full kv_cache block).
+        # Here, a chunk is one tensor slice: [kv_idx, layer_idx, :, :, :].
         codebook = self._build_huffman_codebook(exp)
         exp_bitstream, exp_num_valid_bits = self._huffman_encode_symbols(exp, codebook)
         return CompressedChunk(
