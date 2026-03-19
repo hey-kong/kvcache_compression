@@ -92,27 +92,27 @@ class HuffmanCompressor:
         kv_cache_cpu = self._to_cpu_bf16(kv_cache)
 
         _, num_layers, _, _, _ = kv_cache_cpu.shape
-        out: List[List[CompressedChunk]] = [[], []]
+        compressed_kv_cache: List[List[CompressedChunk]] = [[], []]
         for kv_idx in range(2):
             for layer_idx in range(num_layers):
-                out[kv_idx].append(self._compress_chunk(kv_cache_cpu[kv_idx, layer_idx]))
-        return out
+                compressed_kv_cache[kv_idx].append(self._compress_chunk(kv_cache_cpu[kv_idx, layer_idx]))
+        return compressed_kv_cache
 
     @torch.inference_mode()
     def decompress(
         self,
-        chunks_batch: List[List[List[CompressedChunk]]],
+        compressed_kv_caches: List[List[List[CompressedChunk]]],
         device: Optional[torch.device | str] = None,
     ) -> torch.Tensor:
         """Single-thread decompression."""
         self._assert_cpu_device(device)
-        self._validate_chunk_batch(chunks_batch)
+        self._validate_chunk_batch(compressed_kv_caches)
 
-        num_blocks = len(chunks_batch)
-        num_layers = len(chunks_batch[0][0])
-        block_size, num_kv_heads, head_size = chunks_batch[0][0][0].orig_shape
+        num_blocks = len(compressed_kv_caches)
+        num_layers = len(compressed_kv_caches[0][0])
+        block_size, num_kv_heads, head_size = compressed_kv_caches[0][0][0].orig_shape
 
-        out = torch.empty(
+        kv_caches = torch.empty(
             (num_blocks, 2, num_layers, block_size, num_kv_heads, head_size),
             dtype=torch.bfloat16,
             device="cpu",
@@ -121,7 +121,7 @@ class HuffmanCompressor:
         for block_idx in range(num_blocks):
             for kv_idx in range(2):
                 for layer_idx in range(num_layers):
-                    chunk = chunks_batch[block_idx][kv_idx][layer_idx]
+                    chunk = compressed_kv_caches[block_idx][kv_idx][layer_idx]
                     if not _HAS_HUFFMAN_EXT:
                         raise RuntimeError(
                             "Single-thread decompress requires Huffman C++ extension "
@@ -147,28 +147,28 @@ class HuffmanCompressor:
                         | (exp.astype(np.uint16) << 7)
                         | (non_exp.astype(np.uint16) & 0x7F)
                     ).astype(np.uint16, copy=False)
-                    out[block_idx, kv_idx, layer_idx] = torch.from_numpy(bits.copy()).view(
+                    kv_caches[block_idx, kv_idx, layer_idx] = torch.from_numpy(bits.copy()).view(
                         torch.bfloat16
                     ).reshape(chunk.orig_shape)
 
-        return out
+        return kv_caches
 
     @torch.inference_mode()
     def decompress_parallel(
         self,
-        chunks_batch: List[List[List[CompressedChunk]]],
+        compressed_kv_caches: List[List[List[CompressedChunk]]],
         device: Optional[torch.device | str] = None,
         num_workers: Optional[int] = None,
     ) -> torch.Tensor:
         """Multi-thread decompression."""
         self._assert_cpu_device(device)
-        self._validate_chunk_batch(chunks_batch)
+        self._validate_chunk_batch(compressed_kv_caches)
 
-        num_blocks = len(chunks_batch)
-        num_layers = len(chunks_batch[0][0])
-        block_size, num_kv_heads, head_size = chunks_batch[0][0][0].orig_shape
+        num_blocks = len(compressed_kv_caches)
+        num_layers = len(compressed_kv_caches[0][0])
+        block_size, num_kv_heads, head_size = compressed_kv_caches[0][0][0].orig_shape
 
-        out = torch.empty(
+        kv_caches = torch.empty(
             (num_blocks, 2, num_layers, block_size, num_kv_heads, head_size),
             dtype=torch.bfloat16,
             device="cpu",
@@ -178,7 +178,7 @@ class HuffmanCompressor:
 
         for layer_idx in range(num_layers):
             for kv_idx in range(2):
-                layer_chunks = [chunks_batch[block_idx][kv_idx][layer_idx] for block_idx in range(num_blocks)]
+                layer_chunks = [compressed_kv_caches[block_idx][kv_idx][layer_idx] for block_idx in range(num_blocks)]
 
                 non_exp_bytes_list = [chunk.non_exp_bytes for chunk in layer_chunks]
                 bitstream_list = [chunk.exp_bitstream for chunk in layer_chunks]
@@ -206,16 +206,16 @@ class HuffmanCompressor:
 
                 for block_idx, bits in enumerate(layer_bits_list):
                     shape = layer_chunks[block_idx].orig_shape
-                    out[block_idx, kv_idx, layer_idx] = torch.from_numpy(bits.copy()).view(torch.bfloat16).reshape(shape)
+                    kv_caches[block_idx, kv_idx, layer_idx] = torch.from_numpy(bits.copy()).view(torch.bfloat16).reshape(shape)
 
-                # layer_cpu = out[:, :, layer_idx]
+                # layer_cpu = kv_caches[:, :, layer_idx]
                 # layer_gpu = layer_cpu.to("cuda", non_blocking=True)
 
-        return out
+        return kv_caches
 
-    def compressed_size_bytes(self, chunks: List[List[CompressedChunk]]) -> int:
+    def compressed_size_bytes(self, compressed_kv_cache: List[List[CompressedChunk]]) -> int:
         total = 0
-        for kv_chunks in chunks:
+        for kv_chunks in compressed_kv_cache:
             for c in kv_chunks:
                 total += len(c.non_exp_bytes)
                 total += len(c.exp_bitstream)
@@ -236,13 +236,13 @@ class HuffmanCompressor:
         if kv_cache.shape[0] != 2:
             raise ValueError(f"Expected kv_cache.shape[0] == 2 for (K,V), got {kv_cache.shape[0]}")
 
-    def _validate_chunk_batch(self, chunks_batch: List[List[List[CompressedChunk]]]) -> None:
-        if len(chunks_batch) == 0:
-            raise ValueError("chunks_batch must be non-empty")
+    def _validate_chunk_batch(self, compressed_kv_caches: List[List[List[CompressedChunk]]]) -> None:
+        if len(compressed_kv_caches) == 0:
+            raise ValueError("compressed_kv_caches must be non-empty")
 
         ref_layers = None
         ref_shape = None
-        for block_idx, block_chunks in enumerate(chunks_batch):
+        for block_idx, block_chunks in enumerate(compressed_kv_caches):
             if len(block_chunks) != 2:
                 raise ValueError(f"Block {block_idx} should have 2 entries for K/V")
             if len(block_chunks[0]) == 0:
