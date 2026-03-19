@@ -104,7 +104,7 @@ class HuffmanCompressor:
         compressed_kv_caches: List[List[List[CompressedChunk]]],
         device: Optional[torch.device | str] = None,
     ) -> torch.Tensor:
-        """Single-thread decompression."""
+        """Single-thread decompression for a batch of compressed KV caches."""
         self._assert_cpu_device(device)
         self._validate_chunk_batch(compressed_kv_caches)
 
@@ -112,7 +112,7 @@ class HuffmanCompressor:
         num_layers = len(compressed_kv_caches[0][0])
         block_size, num_kv_heads, head_size = compressed_kv_caches[0][0][0].orig_shape
 
-        kv_caches = torch.empty(
+        decompressed_kv_caches = torch.empty(
             (num_blocks, 2, num_layers, block_size, num_kv_heads, head_size),
             dtype=torch.bfloat16,
             device="cpu",
@@ -147,11 +147,11 @@ class HuffmanCompressor:
                         | (exp.astype(np.uint16) << 7)
                         | (non_exp.astype(np.uint16) & 0x7F)
                     ).astype(np.uint16, copy=False)
-                    kv_caches[block_idx, kv_idx, layer_idx] = torch.from_numpy(bits.copy()).view(
+                    decompressed_kv_caches[block_idx, kv_idx, layer_idx] = torch.from_numpy(bits.copy()).view(
                         torch.bfloat16
                     ).reshape(chunk.orig_shape)
 
-        return kv_caches
+        return decompressed_kv_caches
 
     @torch.inference_mode()
     def decompress_parallel(
@@ -160,7 +160,7 @@ class HuffmanCompressor:
         device: Optional[torch.device | str] = None,
         num_workers: Optional[int] = None,
     ) -> torch.Tensor:
-        """Multi-thread decompression."""
+        """Multi-thread decompression for a batch of compressed KV caches."""
         self._assert_cpu_device(device)
         self._validate_chunk_batch(compressed_kv_caches)
 
@@ -168,7 +168,7 @@ class HuffmanCompressor:
         num_layers = len(compressed_kv_caches[0][0])
         block_size, num_kv_heads, head_size = compressed_kv_caches[0][0][0].orig_shape
 
-        kv_caches = torch.empty(
+        decompressed_kv_caches = torch.empty(
             (num_blocks, 2, num_layers, block_size, num_kv_heads, head_size),
             dtype=torch.bfloat16,
             device="cpu",
@@ -206,12 +206,12 @@ class HuffmanCompressor:
 
                 for block_idx, bits in enumerate(layer_bits_list):
                     shape = layer_chunks[block_idx].orig_shape
-                    kv_caches[block_idx, kv_idx, layer_idx] = torch.from_numpy(bits.copy()).view(torch.bfloat16).reshape(shape)
+                    decompressed_kv_caches[block_idx, kv_idx, layer_idx] = torch.from_numpy(bits.copy()).view(torch.bfloat16).reshape(shape)
 
-                # layer_cpu = kv_caches[:, :, layer_idx]
+                # layer_cpu = decompressed_kv_caches[:, :, layer_idx]
                 # layer_gpu = layer_cpu.to("cuda", non_blocking=True)
 
-        return kv_caches
+        return decompressed_kv_caches
 
     def compressed_size_bytes(self, compressed_kv_cache: List[List[CompressedChunk]]) -> int:
         total = 0
