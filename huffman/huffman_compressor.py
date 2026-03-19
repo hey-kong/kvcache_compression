@@ -213,15 +213,37 @@ class HuffmanCompressor:
 
         return decompressed_kv_caches
 
-    def compressed_size_bytes(self, compressed_kv_cache: List[List[CompressedChunk]]) -> int:
-        total = 0
-        for kv_chunks in compressed_kv_cache:
+    def compressed_size_bytes(
+        self,
+        compressed_kv_cache: List[List[CompressedChunk]],
+    ) -> Tuple[int, int, int]:
+        """Return total size plus K/V payload sizes.
+
+        Returns:
+            (total_size_bytes, k_size_bytes, v_size_bytes)
+            - total_size_bytes includes payload + codebook bytes
+            - k_size_bytes / v_size_bytes include payload bytes only
+              (non_exp_bytes + exp_bitstream), excluding codebooks
+        """
+        total_size_bytes = 0
+        k_size_bytes = 0
+        v_size_bytes = 0
+
+        for kv_idx, kv_chunks in enumerate(compressed_kv_cache):
+            kv_payload_size = 0
             for c in kv_chunks:
-                total += len(c.non_exp_bytes)
-                total += len(c.exp_bitstream)
+                payload_size = len(c.non_exp_bytes) + len(c.exp_bitstream)
+                kv_payload_size += payload_size
+                total_size_bytes += payload_size
                 for _, code in c.codebook.encode_table.items():
-                    total += 1 + 2 + (len(code) + 7) // 8
-        return total
+                    total_size_bytes += 1 + 2 + (len(code) + 7) // 8
+
+            if kv_idx == 0:
+                k_size_bytes = kv_payload_size
+            elif kv_idx == 1:
+                v_size_bytes = kv_payload_size
+
+        return total_size_bytes, k_size_bytes, v_size_bytes
 
     def original_size_bytes(self, kv_cache: torch.Tensor) -> int:
         return kv_cache.numel() * kv_cache.element_size()
