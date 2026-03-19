@@ -108,21 +108,20 @@ class HuffmanCompressor:
             for _ in range(num_blocks)
         ]
 
-        tasks = [
-            (block_idx, kv_idx, layer_idx)
-            for block_idx in range(num_blocks)
-            for kv_idx in range(2)
-            for layer_idx in range(num_layers)
-        ]
+        workers = num_blocks if num_workers is None else self._resolve_num_workers(num_workers)
 
-        def work(task: Tuple[int, int, int]) -> Tuple[int, int, int, CompressedChunk]:
-            block_idx, kv_idx, layer_idx = task
-            chunk = self._compress_chunk(kv_caches_cpu[block_idx, kv_idx, layer_idx])
-            return block_idx, kv_idx, layer_idx, chunk
+        def work_block(block_idx: int) -> Tuple[int, List[List[CompressedChunk]]]:
+            block_out: List[List[CompressedChunk]] = [[], []]
+            for layer_idx in range(num_layers):
+                for kv_idx in range(2):
+                    block_out[kv_idx].append(
+                        self._compress_chunk(kv_caches_cpu[block_idx, kv_idx, layer_idx])
+                    )
+            return block_idx, block_out
 
-        with ThreadPoolExecutor(max_workers=self._resolve_num_workers(num_workers)) as ex:
-            for block_idx, kv_idx, layer_idx, chunk in ex.map(work, tasks):
-                out[block_idx][kv_idx][layer_idx] = chunk
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            for block_idx, block_out in ex.map(work_block, range(num_blocks)):
+                out[block_idx] = block_out
 
         return out
 
@@ -155,21 +154,22 @@ class HuffmanCompressor:
             device="cpu",
         )
 
-        tasks = [
-            (block_idx, kv_idx, layer_idx)
-            for block_idx in range(num_blocks)
-            for kv_idx in range(2)
-            for layer_idx in range(num_layers)
-        ]
+        workers = num_blocks if num_workers is None else self._resolve_num_workers(num_workers)
 
-        def work(task: Tuple[int, int, int]) -> Tuple[int, int, int, torch.Tensor]:
-            block_idx, kv_idx, layer_idx = task
-            restored = self._decompress_chunk(chunks_batch[block_idx][kv_idx][layer_idx])
-            return block_idx, kv_idx, layer_idx, restored
+        def work_block(block_idx: int) -> Tuple[int, List[List[torch.Tensor]]]:
+            block_out: List[List[torch.Tensor]] = [[], []]
+            for layer_idx in range(num_layers):
+                for kv_idx in range(2):
+                    block_out[kv_idx].append(
+                        self._decompress_chunk(chunks_batch[block_idx][kv_idx][layer_idx])
+                    )
+            return block_idx, block_out
 
-        with ThreadPoolExecutor(max_workers=self._resolve_num_workers(num_workers)) as ex:
-            for block_idx, kv_idx, layer_idx, restored in ex.map(work, tasks):
-                out[block_idx, kv_idx, layer_idx] = restored
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            for block_idx, block_out in ex.map(work_block, range(num_blocks)):
+                for kv_idx in range(2):
+                    for layer_idx in range(num_layers):
+                        out[block_idx, kv_idx, layer_idx] = block_out[kv_idx][layer_idx]
 
         return out
 
