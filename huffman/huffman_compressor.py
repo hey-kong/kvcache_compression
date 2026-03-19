@@ -46,7 +46,8 @@ class HuffmanCompressor:
     """CPU-only lossless compressor for BF16 KV cache."""
 
     def __init__(self):
-        pass
+        self._encode_cache: Dict[int, Dict[int, Tuple[int, int]]] = {}
+        self._decode_trie_cache: Dict[int, Tuple[List[int], List[int], List[int]]] = {}
 
     @staticmethod
     def _resolve_num_workers(num_workers: Optional[int]) -> int:
@@ -355,8 +356,28 @@ class HuffmanCompressor:
         symbols: np.ndarray,
         codebook: HuffmanCodebook,
     ) -> Tuple[bytes, int]:
-        bitstring = "".join(codebook.encode_table[int(s)] for s in symbols.tolist())
-        return self._pack_bitstring_to_bytes(bitstring)
+        encode_compiled = self._get_compiled_encode_table(codebook)
+        out = bytearray()
+        bit_buffer = 0
+        bit_count = 0
+        num_valid_bits = 0
+
+        for s in symbols.tolist():
+            code, code_len = encode_compiled[int(s)]
+            bit_buffer = (bit_buffer << code_len) | code
+            bit_count += code_len
+            num_valid_bits += code_len
+
+            while bit_count >= 8:
+                shift = bit_count - 8
+                out.append((bit_buffer >> shift) & 0xFF)
+                bit_buffer &= (1 << shift) - 1
+                bit_count -= 8
+
+        if bit_count > 0:
+            out.append((bit_buffer << (8 - bit_count)) & 0xFF)
+
+        return bytes(out), num_valid_bits
 
     def _huffman_decode_symbols(
         self,
@@ -365,42 +386,82 @@ class HuffmanCompressor:
         codebook: HuffmanCodebook,
         expected_num_symbols: int,
     ) -> np.ndarray:
-        bitstring = self._unpack_bytes_to_bitstring(bitstream, num_valid_bits)
+        left, right, symbol = self._get_decode_trie(codebook)
+        node = 0
+        out = np.empty(expected_num_symbols, dtype=np.uint8)
+        out_idx = 0
+        bits_read = 0
 
-        out = []
-        cur = ""
-        decode_table = codebook.decode_table
-        for ch in bitstring:
-            cur += ch
-            if cur in decode_table:
-                out.append(decode_table[cur])
-                cur = ""
-                if len(out) == expected_num_symbols:
+        for byte in bitstream:
+            for bit_idx in range(7, -1, -1):
+                if bits_read == num_valid_bits:
                     break
+                node = right[node] if ((byte >> bit_idx) & 1) else left[node]
+                if node < 0:
+                    raise ValueError("Invalid Huffman bitstream for this codebook")
+                sym = symbol[node]
+                if sym >= 0:
+                    if out_idx >= expected_num_symbols:
+                        raise ValueError("Decoded more symbols than expected")
+                    out[out_idx] = sym
+                    out_idx += 1
+                    node = 0
+                bits_read += 1
+            if bits_read == num_valid_bits:
+                break
 
-        if len(out) != expected_num_symbols:
+        if out_idx != expected_num_symbols:
             raise ValueError(
-                f"Huffman decode failed: expected {expected_num_symbols} symbols, got {len(out)}"
+                f"Huffman decode failed: expected {expected_num_symbols} symbols, got {out_idx}"
             )
+        return out
 
-        return np.asarray(out, dtype=np.uint8)
+    def _get_compiled_encode_table(self, codebook: HuffmanCodebook) -> Dict[int, Tuple[int, int]]:
+        key = id(codebook)
+        cached = self._encode_cache.get(key)
+        if cached is not None:
+            return cached
 
-    def _pack_bitstring_to_bytes(self, bitstring: str) -> Tuple[bytes, int]:
-        num_valid_bits = len(bitstring)
-        if num_valid_bits == 0:
-            return b"", 0
+        compiled = {
+            sym: (int(bits, 2), len(bits))
+            for sym, bits in codebook.encode_table.items()
+        }
+        self._encode_cache[key] = compiled
+        return compiled
 
-        pad = (-num_valid_bits) % 8
-        if pad:
-            bitstring += "0" * pad
+    def _get_decode_trie(self, codebook: HuffmanCodebook) -> Tuple[List[int], List[int], List[int]]:
+        key = id(codebook)
+        cached = self._decode_trie_cache.get(key)
+        if cached is not None:
+            return cached
 
-        out = bytearray()
-        for i in range(0, len(bitstring), 8):
-            out.append(int(bitstring[i:i + 8], 2))
-        return bytes(out), num_valid_bits
+        left = [-1]
+        right = [-1]
+        symbol = [-1]
 
-    def _unpack_bytes_to_bitstring(self, data: bytes, num_valid_bits: int) -> str:
-        if len(data) == 0:
-            return ""
-        bitstring = "".join(f"{b:08b}" for b in data)
-        return bitstring[:num_valid_bits]
+        for bits, sym in codebook.decode_table.items():
+            node = 0
+            for ch in bits:
+                if ch == "0":
+                    nxt = left[node]
+                    if nxt == -1:
+                        nxt = len(left)
+                        left[node] = nxt
+                        left.append(-1)
+                        right.append(-1)
+                        symbol.append(-1)
+                    node = nxt
+                else:
+                    nxt = right[node]
+                    if nxt == -1:
+                        nxt = len(left)
+                        right[node] = nxt
+                        left.append(-1)
+                        right.append(-1)
+                        symbol.append(-1)
+                    node = nxt
+            symbol[node] = int(sym)
+
+        trie = (left, right, symbol)
+        self._decode_trie_cache[key] = trie
+        return trie
