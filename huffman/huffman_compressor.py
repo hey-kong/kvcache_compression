@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import heapq
 import os
+import time
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
@@ -37,6 +38,16 @@ class CompressedChunk:
     exp_num_valid_bits: int
     codebook: HuffmanCodebook
     orig_shape: Tuple[int, ...]
+
+
+@dataclass
+class LayerCompressionStats:
+    layer_idx: int
+    original_size_bytes: int
+    compressed_size_bytes: int
+    compression_ratio: float
+    compression_time_ms: float
+    decompression_time_ms: Optional[float] = None
 
 
 class _HuffNode:
@@ -97,6 +108,59 @@ class HuffmanCompressor:
             for layer_idx in range(num_layers):
                 compressed_kv_cache[kv_idx].append(self._compress_chunk(kv_cache_cpu[kv_idx, layer_idx]))
         return compressed_kv_cache
+
+    @torch.inference_mode()
+    def compress_with_stats(
+        self,
+        kv_cache: torch.Tensor,
+        print_stats: bool = True,
+    ) -> Tuple[List[List[CompressedChunk]], List[LayerCompressionStats]]:
+        """Compress KV cache and return per-layer compression stats.
+
+        Compression ratio is defined as: compressed_size / original_size.
+        """
+        self._validate_kv_cache(kv_cache)
+        kv_cache_cpu = self._to_cpu_bf16(kv_cache)
+
+        _, num_layers, _, _, _ = kv_cache_cpu.shape
+        compressed_kv_cache: List[List[CompressedChunk]] = [[], []]
+        layer_stats: List[LayerCompressionStats] = []
+
+        for layer_idx in range(num_layers):
+            t0 = time.perf_counter()
+            layer_original_bytes = 0
+            layer_compressed_bytes = 0
+
+            for kv_idx in range(2):
+                layer_tensor = kv_cache_cpu[kv_idx, layer_idx]
+                chunk = self._compress_chunk(layer_tensor)
+                compressed_kv_cache[kv_idx].append(chunk)
+
+                original_size = layer_tensor.numel() * layer_tensor.element_size()
+                compressed_size = (
+                    len(chunk.non_exp_bytes)
+                    + len(chunk.exp_bitstream)
+                    + self._estimate_codebook_size_bytes(chunk.codebook)
+                )
+                layer_original_bytes += original_size
+                layer_compressed_bytes += compressed_size
+
+            compress_ms = (time.perf_counter() - t0) * 1000.0
+            ratio = layer_compressed_bytes / max(1, layer_original_bytes)
+            layer_stats.append(
+                LayerCompressionStats(
+                    layer_idx=layer_idx,
+                    original_size_bytes=layer_original_bytes,
+                    compressed_size_bytes=layer_compressed_bytes,
+                    compression_ratio=ratio,
+                    compression_time_ms=compress_ms,
+                )
+            )
+
+        if print_stats:
+            self.print_layer_stats(layer_stats)
+
+        return compressed_kv_cache, layer_stats
 
     @torch.inference_mode()
     def decompress(
@@ -212,6 +276,112 @@ class HuffmanCompressor:
             # layer_gpu = layer_cpu.to("cuda", non_blocking=True)
 
         return decompressed_kv_caches
+
+    @torch.inference_mode()
+    def decompress_parallel_with_stats(
+        self,
+        compressed_kv_caches: List[List[List[CompressedChunk]]],
+        device: Optional[torch.device | str] = None,
+        num_workers: Optional[int] = None,
+        print_stats: bool = True,
+    ) -> Tuple[torch.Tensor, List[LayerCompressionStats]]:
+        """Parallel decompress with per-layer decompression timing.
+
+        For each layer, decompression time includes both K/V tensors across all blocks.
+        """
+        self._assert_cpu_device(device)
+        self._validate_chunk_batch(compressed_kv_caches)
+
+        num_blocks = len(compressed_kv_caches)
+        num_layers = len(compressed_kv_caches[0][0])
+        block_size, num_kv_heads, head_size = compressed_kv_caches[0][0][0].orig_shape
+
+        decompressed_kv_caches = torch.empty(
+            (num_blocks, 2, num_layers, block_size, num_kv_heads, head_size),
+            dtype=torch.bfloat16,
+            device="cpu",
+        )
+
+        workers = num_blocks if num_workers is None else self._resolve_num_workers(num_workers)
+        layer_stats: List[LayerCompressionStats] = []
+
+        for layer_idx in range(num_layers):
+            t0 = time.perf_counter()
+            layer_original_bytes = 0
+            layer_compressed_bytes = 0
+
+            for kv_idx in range(2):
+                layer_chunks = [compressed_kv_caches[block_idx][kv_idx][layer_idx] for block_idx in range(num_blocks)]
+
+                non_exp_bytes_list = [chunk.non_exp_bytes for chunk in layer_chunks]
+                bitstream_list = [chunk.exp_bitstream for chunk in layer_chunks]
+                num_valid_bits_list = [int(chunk.exp_num_valid_bits) for chunk in layer_chunks]
+                expected_num_symbols_list = [int(chunk.exp_num_symbols) for chunk in layer_chunks]
+                left_nodes_list: List[List[int]] = []
+                right_nodes_list: List[List[int]] = []
+                symbol_nodes_list: List[List[int]] = []
+                for chunk in layer_chunks:
+                    left, right, symbol = self._get_decode_trie(chunk.codebook)
+                    left_nodes_list.append(left)
+                    right_nodes_list.append(right)
+                    symbol_nodes_list.append(symbol)
+                    layer_compressed_bytes += (
+                        len(chunk.non_exp_bytes)
+                        + len(chunk.exp_bitstream)
+                        + self._estimate_codebook_size_bytes(chunk.codebook)
+                    )
+                    layer_original_bytes += int(np.prod(chunk.orig_shape)) * 2
+
+                layer_bits_list = decompress_layer_parallel_cpp(
+                    non_exp_bytes_list,
+                    bitstream_list,
+                    num_valid_bits_list,
+                    expected_num_symbols_list,
+                    left_nodes_list,
+                    right_nodes_list,
+                    symbol_nodes_list,
+                    int(workers),
+                )
+
+                for block_idx, bits in enumerate(layer_bits_list):
+                    shape = layer_chunks[block_idx].orig_shape
+                    decompressed_kv_caches[block_idx, kv_idx, layer_idx] = torch.from_numpy(bits.copy()).view(torch.bfloat16).reshape(shape)
+
+            decompress_ms = (time.perf_counter() - t0) * 1000.0
+            ratio = layer_compressed_bytes / max(1, layer_original_bytes)
+            layer_stats.append(
+                LayerCompressionStats(
+                    layer_idx=layer_idx,
+                    original_size_bytes=layer_original_bytes,
+                    compressed_size_bytes=layer_compressed_bytes,
+                    compression_ratio=ratio,
+                    compression_time_ms=0.0,
+                    decompression_time_ms=decompress_ms,
+                )
+            )
+
+        if print_stats:
+            self.print_layer_stats(layer_stats)
+
+        return decompressed_kv_caches, layer_stats
+
+    @staticmethod
+    def print_layer_stats(layer_stats: List[LayerCompressionStats]) -> None:
+        """Pretty-print per-layer compression ratio and timing."""
+        print(
+            f"{'layer':>5} | {'orig(KB)':>10} | {'comp(KB)':>10} | {'ratio':>8} | {'comp(ms)':>9} | {'decomp(ms)':>11}"
+        )
+        print("-" * 70)
+        for s in layer_stats:
+            decomp = "-" if s.decompression_time_ms is None else f"{s.decompression_time_ms:11.3f}"
+            print(
+                f"{s.layer_idx:5d} | "
+                f"{s.original_size_bytes / 1024:10.2f} | "
+                f"{s.compressed_size_bytes / 1024:10.2f} | "
+                f"{s.compression_ratio:8.4f} | "
+                f"{s.compression_time_ms:9.3f} | "
+                f"{decomp}"
+            )
 
     def compressed_size_bytes(
         self,
